@@ -110,6 +110,20 @@ def in_poll_window(now: datetime) -> bool:
     return False
 
 
+def result_ready(value: object) -> bool:
+    """True when an official 2D result is a number. '--' is not ready."""
+    return isinstance(value, str) and value.strip().isdigit()
+
+
+def should_keep_polling(now: datetime, evening_settled: bool) -> bool:
+    """Keep fetching after 16:30 until today's 430 result is published."""
+    if in_poll_window(now):
+        return True
+    if now.weekday() >= 5:
+        return False
+    return clock_of(now) > EVENING_LIVE_END and not evening_settled
+
+
 def format_updatetime(now: datetime) -> str:
     hour = now.hour
     if hour == 0:
@@ -153,7 +167,7 @@ def build_live_map(
     set_text: str,
     value_text: str,
     updated_at: str,
-    from_fallback: bool,
+    _from_fallback: bool,
 ) -> dict | None:
     """Build the object that used to be written to the live file."""
     row = dict(row)
@@ -194,14 +208,9 @@ def build_live_map(
         return live
 
     if window == EVENING_BREAK:
-        # No daily row after 16:30 keeps the template result and turns live off.
-        # A row that is still "----.--" keeps the API number on.
-        if not from_fallback and row.get("430set") == PLACEHOLDER:
-            live = {
-                key: value
-                for key, value in row.items()
-                if key not in ("430set", "430value")
-            }
+        # Stay on the API number until 430 itself is a result, then turn OFF.
+        if not result_ready(row.get("430")):
+            live = dict(row)
             live["430set"] = set_text
             live["430value"] = value_text
             live["live"] = getlive(set_text, value_text)
@@ -263,6 +272,14 @@ class LiveRunner:
         self.session = requests.Session()
         self.session.headers["User-Agent"] = "newliverunner/1.0"
         self.last_payload: str | None = None
+        self.evening_settled = False
+        self.settled_date = ""
+
+    def roll_day(self, now: datetime) -> None:
+        day = now.strftime("%Y/%m/%d")
+        if day != self.settled_date:
+            self.settled_date = day
+            self.evening_settled = False
 
     def remember_updatetime(self, window: str, now: datetime) -> str:
         stamp = format_updatetime(now)
@@ -324,9 +341,20 @@ class LiveRunner:
         if from_fallback:
             row = load_fallback(now)
             log.info("no daily row for %s, using undate", now.strftime("%Y/%m/%d"))
-        updated_at = self.remember_updatetime(window, now)
+        waiting_for_430 = window == EVENING_BREAK and not result_ready(row.get("430"))
+        if window == EVENING_BREAK and not waiting_for_430:
+            self.evening_settled = True
+        elif waiting_for_430:
+            log.info("430 is still %s, staying On", row.get("430"))
+        stamp_window = EVENING_LIVE if waiting_for_430 else window
+        updated_at = self.remember_updatetime(stamp_window, now)
         live_map = build_live_map(
-            window, row, set_text, value_text, updated_at, from_fallback
+            stamp_window if waiting_for_430 else window,
+            row,
+            set_text,
+            value_text,
+            updated_at,
+            from_fallback,
         )
         if live_map is None:
             return
@@ -338,13 +366,14 @@ class LiveRunner:
         while True:
             started = time.monotonic()
             now = datetime.now(TZ)
+            self.roll_day(now)
             window = window_of(now)
             try:
                 if window != last_window:
                     log.info(WINDOW_LABEL[window])
                     last_window = window
                     self.cycle(now)
-                elif in_poll_window(now):
+                elif should_keep_polling(now, self.evening_settled):
                     self.cycle(now)
             except requests.Timeout:
                 log.warning("request timed out")
@@ -385,6 +414,13 @@ def self_test() -> None:
     assert in_poll_window(at(wednesday, 16, 30, 0))
     assert window_of(at(wednesday, 16, 30, 1)) == EVENING_BREAK
     assert not in_poll_window(at(wednesday, 16, 30, 1))
+    assert should_keep_polling(at(wednesday, 16, 30, 1), False)
+    assert not should_keep_polling(at(wednesday, 16, 30, 1), True)
+    assert not should_keep_polling(at(31, 17, 0), False)
+    assert result_ready("90")
+    assert result_ready("03")
+    assert not result_ready("--")
+    assert not result_ready("----.--")
 
     noon = at(wednesday, 12, 0, 0)
     midnight = at(wednesday, 0, 5, 9)
@@ -455,10 +491,29 @@ def self_test() -> None:
     assert done["live"] == "03"
     assert done["430set"] == "1566.10"
 
+    held = dict(published)
+    held["430set"] = "1518.59"
+    held["430value"] = "73620.02"
+    held["430"] = "--"
+    held_live = build_live_map(EVENING_BREAK, held, "1518.59", "73620.02", stamp, False)
+    assert held_live is not None
+    assert held_live["status"] == "On"
+    assert held_live["430"] == "--"
+    assert held_live["live"] == "90"
+
+    released = dict(held)
+    released["430"] = "90"
+    released_live = build_live_map(EVENING_BREAK, released, "1000.00", "1000.00", stamp, False)
+    assert released_live is not None
+    assert released_live["status"] == "OFF"
+    assert released_live["live"] == "90"
+    assert released_live["430set"] == "1518.59"
+
     fallback = build_live_map(EVENING_BREAK, dict(DEFAULT_UNDATE), "1566.10", "65443.68", stamp, True)
     assert fallback is not None
-    assert fallback["status"] == "OFF"
-    assert fallback["live"] == "--"
+    assert fallback["status"] == "On"
+    assert fallback["live"] == "03"
+    assert fallback["430"] == "--"
     assert build_live_map(HOLIDAY, morning_row, "1.0", "1.0", stamp, False) is None
     print("self-test ok")
 

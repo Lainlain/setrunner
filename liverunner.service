@@ -1,0 +1,16 @@
+[Unit]
+Description=Myanmar 2D live runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www
+Group=www
+WorkingDirectory=/www/wwwroot/setrunner
+ExecStart=/usr/bin/python3 /www/wwwroot/setrunner/main.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
